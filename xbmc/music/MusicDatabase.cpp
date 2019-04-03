@@ -1401,7 +1401,7 @@ bool CMusicDatabase::GetArtist(int idArtist, CArtist &artist, bool fetchAll /* =
     int discographyOffset = artist_enumCount;
 
     artist.discography.clear();
-    artist = GetArtistFromDataset(m_pDS.get()->get_sql_record(), 0, fetchAll);
+    artist = GetArtistFromDataset(m_pDS.get()->get_sql_record(), 0, true); // inc scraped art URLs
     if (fetchAll)
     {
       while (!m_pDS->eof())
@@ -7482,16 +7482,17 @@ void CMusicDatabase::SetLibraryLastUpdated()
 }
 
 
-unsigned int CMusicDatabase::GetSongIDs(const Filter &filter, std::vector<std::pair<int,int> > &songIDs)
+unsigned int CMusicDatabase::GetRandomSongIDs(const Filter &filter, std::vector<std::pair<int,int> > &songIDs)
 {
   try
   {
     if (NULL == m_pDB.get()) return 0;
     if (NULL == m_pDS.get()) return 0;
 
-    std::string strSQL = "select idSong from songview ";
+    std::string strSQL = "SELECT idSong FROM songview ";
     if (!CDatabase::BuildSQL(strSQL, filter, strSQL))
       return false;
+    strSQL += PrepareSQL(" ORDER BY RANDOM()");
 
     if (!m_pDS->query(strSQL)) return 0;
     songIDs.clear();
@@ -7503,7 +7504,7 @@ unsigned int CMusicDatabase::GetSongIDs(const Filter &filter, std::vector<std::p
     songIDs.reserve(m_pDS->num_rows());
     while (!m_pDS->eof())
     {
-      songIDs.push_back(std::make_pair<int,int>(1,m_pDS->fv(song_idSong).get_asInt()));
+      songIDs.push_back(std::make_pair<int,int>(1, m_pDS->fv(song_idSong).get_asInt()));
       m_pDS->next();
     }    // cleanup
     m_pDS->close();
@@ -8883,53 +8884,6 @@ bool CMusicDatabase::GetGenresJSON(CFileItemList& items, bool bSources)
   return false;
 }
 
-bool CMusicDatabase::GetRandomSong(CFileItem* item, int& idSong, const Filter &filter)
-{
-  try
-  {
-    idSong = -1;
-
-    if (NULL == m_pDB.get()) return false;
-    if (NULL == m_pDS.get()) return false;
-
-    // Get a random song that matches filter criteria (which may exclude some songs)
-    // We don't use PrepareSQL here, as the WHERE clause is already formatted but must
-    // use songview as that is what the WHERE clause has as reference table
-    std::string strSQL = "SELECT idSong FROM songview ";
-    Filter extFilter = filter;
-    extFilter.AppendOrder(PrepareSQL("RANDOM()"));
-    extFilter.limit = "1";
-    if (!CDatabase::BuildSQL(strSQL, extFilter, strSQL))
-      return false;
-    if (!m_pDS->query(strSQL))
-      return false;
-    int iRowsFound = m_pDS->num_rows();
-    if (iRowsFound != 1)
-    {
-      m_pDS->close();
-      return false;
-    }
-    idSong = m_pDS->fv("songview.idSong").get_asInt();
-    m_pDS->close();
-
-    // Fetch the full song details, including contributors
-    std::string baseDir = StringUtils::Format("musicdb://songs/?songid=%d", idSong);
-    CFileItemList items;
-    GetSongsFullByWhere(baseDir, Filter(), items, SortDescription(), true);
-    if (items.Size() > 0)
-    {
-      *item = *items[0];
-      return true;
-    }
-    return false;
-  }
-  catch(...)
-  {
-    CLog::Log(LOGERROR, "%s(%s) failed", __FUNCTION__, filter.where.c_str());
-  }
-  return false;
-}
-
 bool CMusicDatabase::GetCompilationAlbums(const std::string& strBaseDir, CFileItemList& items)
 {
   CMusicDbUrl musicUrl;
@@ -9689,10 +9643,19 @@ void CMusicDatabase::ExportToXML(const CLibExportSettings& settings,  CGUIDialog
             {
               // Save art in album folder
               // Note thumb resoluton may be lower than original when overwriting
-              std::string thumb = GetArtForItem(album.idAlbum, MediaTypeAlbum, "thumb");
-              std::string imagePath = URIUtils::AddFileToFolder(strPath, "folder.jpg");
-              if (!thumb.empty() && (settings.m_overwrite || !CFile::Exists(imagePath)))
-                CTextureCache::GetInstance().Export(thumb, imagePath);
+              std::map<std::string, std::string> artwork;
+              std::string savedArtfile;
+              if (GetArtForItem(album.idAlbum, MediaTypeAlbum, artwork))
+              {
+                for (const auto &art : artwork)
+                {
+                  if (art.first == "thumb")
+                    savedArtfile = URIUtils::AddFileToFolder(strPath, "folder");
+                  else
+                    savedArtfile = URIUtils::AddFileToFolder(strPath, art.first);
+                  CTextureCache::GetInstance().Export(art.second, savedArtfile, settings.m_overwrite);
+                }
+              }
             }
             xmlDoc.Clear();
             TiXmlDeclaration decl("1.0", "UTF-8", "yes");
@@ -9753,7 +9716,7 @@ void CMusicDatabase::ExportToXML(const CLibExportSettings& settings,  CGUIDialog
       for (const auto &artistId : artistIds)
       {
         CArtist artist;
-        GetArtist(artistId, artist);
+        GetArtist(artistId, artist, true); // include discography
         std::string strPath;
         std::map<std::string, std::string> artwork;
         if (settings.IsSingleFile())
@@ -9802,14 +9765,17 @@ void CMusicDatabase::ExportToXML(const CLibExportSettings& settings,  CGUIDialog
             }
             if (settings.m_artwork)
             {
+              std::string savedArtfile;
               if (GetArtForItem(artist.idArtist, MediaTypeArtist, artwork))
               {
-                std::string savedThumb = URIUtils::AddFileToFolder(strPath, "folder.jpg");
-                std::string savedFanart = URIUtils::AddFileToFolder(strPath, "fanart.jpg");
-                if (artwork.find("thumb") != artwork.end() && (settings.m_overwrite || !CFile::Exists(savedThumb)))
-                  CTextureCache::GetInstance().Export(artwork["thumb"], savedThumb);
-                if (artwork.find("fanart") != artwork.end() && (settings.m_overwrite || !CFile::Exists(savedFanart)))
-                  CTextureCache::GetInstance().Export(artwork["fanart"], savedFanart);
+                for (const auto &art : artwork)
+                {
+                  if (art.first == "thumb")
+                    savedArtfile = URIUtils::AddFileToFolder(strPath, "folder");
+                  else
+                    savedArtfile = URIUtils::AddFileToFolder(strPath, art.first);
+                  CTextureCache::GetInstance().Export(art.second, savedArtfile, settings.m_overwrite);
+                }
               }
             }
             xmlDoc.Clear();
@@ -9912,7 +9878,7 @@ void CMusicDatabase::ImportFromXML(const std::string &xmlFile)
         if (idArtist > -1)
         {
           CArtist artist;
-          GetArtist(idArtist, artist);
+          GetArtist(idArtist, artist, true); // include discography
           artist.MergeScrapedArtist(importedArtist, true);
           UpdateArtist(artist);
         }
@@ -10012,7 +9978,7 @@ void CMusicDatabase::SetPropertiesFromAlbum(CFileItem& item, const CAlbum& album
   item.SetProperty("album_genre_array", album.genre);
   item.SetProperty("album_title", album.strAlbum);
   if (album.fRating > 0)
-    item.SetProperty("album_rating", album.fRating);
+    item.SetProperty("album_rating", StringUtils::FormatNumber(album.fRating));
   if (album.iUserrating > 0)
     item.SetProperty("album_userrating", album.iUserrating);
   if (album.iVotes > 0)
@@ -10530,13 +10496,6 @@ bool CMusicDatabase::GetFilter(CDbUrl &musicUrl, Filter &filter, SortDescription
     }
     // remove the null string
     filter.AppendWhere("artistview.strArtist != ''");
-
-    // and the various artist entry if applicable
-    if (!albumArtistsOnly)
-    {
-      std::string strVariousArtists = g_localizeStrings.Get(340);
-      filter.AppendWhere(PrepareSQL("artistview.strArtist <> '%s'", strVariousArtists.c_str()));
-    }
   }
   else if (type == "albums")
   {
